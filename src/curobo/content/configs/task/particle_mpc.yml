@@ -61,6 +61,13 @@ cost:
     speed_dt: 0.1 # used only for speed metric
     activation_distance: 0.025
 
+  terminal_obstacle_cfg:
+    weight: 100000.0
+    threshold_distance: 0.05
+    activation_distance: 0.0
+    sum_collisions: True
+    compute_esdf: True
+  
   self_collision_cfg:
     weight: 50000.0
     classify: False

@@ -24,6 +24,10 @@ from curobo.geom.types import WorldConfig
 from curobo.rollout.cost.bound_cost import BoundCost, BoundCostConfig
 from curobo.rollout.cost.dist_cost import DistCost, DistCostConfig
 from curobo.rollout.cost.manipulability_cost import ManipulabilityCost, ManipulabilityCostConfig
+from curobo.rollout.cost.obstacle_distance_cost import (
+    ObstacleDistanceCost,
+    ObstacleDistanceCostConfig,
+)
 from curobo.rollout.cost.primitive_collision_cost import (
     PrimitiveCollisionCost,
     PrimitiveCollisionCostConfig,
@@ -51,6 +55,7 @@ class ArmCostConfig:
     stop_cfg: Optional[StopCostConfig] = None
     self_collision_cfg: Optional[SelfCollisionCostConfig] = None
     primitive_collision_cfg: Optional[PrimitiveCollisionCostConfig] = None
+    terminal_obstacle_cfg: Optional[ObstacleDistanceCostConfig] = None
 
     @staticmethod
     def _get_base_keys():
@@ -60,6 +65,7 @@ class ArmCostConfig:
             "stop_cfg": StopCostConfig,
             "self_collision_cfg": SelfCollisionCostConfig,
             "bound_cfg": BoundCostConfig,
+            "terminal_obstacle_cfg": ObstacleDistanceCostConfig,
         }
         return k_list
 
@@ -97,6 +103,12 @@ class ArmCostConfig:
                 **data_dict["primitive_collision_cfg"],
                 world_coll_checker=world_coll_checker,
                 tensor_args=tensor_args
+            )
+        if "terminal_obstacle_cfg" in data_dict and world_coll_checker is not None:
+            data["terminal_obstacle_cfg"] = ObstacleDistanceCostConfig(
+                **data_dict["terminal_obstacle_cfg"],
+                world_coll_checker=world_coll_checker,
+                tensor_args=tensor_args,
             )
 
         return data
@@ -271,6 +283,12 @@ class ArmBase(RolloutBase, ArmBaseConfig):
             self.cost_cfg.stop_cfg.horizon = self.dynamics_model.horizon
             self.cost_cfg.stop_cfg.dt_traj_params = self.dynamics_model.dt_traj_params
             self.stop_cost = StopCost(self.cost_cfg.stop_cfg)
+        if self.cost_cfg.terminal_obstacle_cfg is not None:
+            self.terminal_obstacle_cost = ObstacleDistanceCost(
+                self.cost_cfg.terminal_obstacle_cfg
+            )
+            if self.dynamics_model.robot_model.total_spheres == 0:
+                self.terminal_obstacle_cost.disable_cost()
         self._goal_buffer.retract_state = self.retract_state
         if self.cost_cfg.primitive_collision_cfg is not None:
             self.primitive_collision_cost = PrimitiveCollisionCost(
@@ -335,31 +353,30 @@ class ArmBase(RolloutBase, ArmBaseConfig):
         self.update_cost_dt(self.dynamics_model.dt_traj_params.base_dt)
         return RolloutBase._init_after_config_load(self)
 
-    def cost_fn(self, state: KinematicModelState, action_batch=None, return_list=False):
+    def cost_terms(self, state: KinematicModelState, action_batch=None):
         # ee_pos_batch, ee_rot_batch = state_dict["ee_pos_seq"], state_dict["ee_rot_seq"]
         state_batch = state.state_seq
-        cost_list = []
+        terms = []
 
-        # compute state bound  cost:
-        if self.bound_cost.enabled:
+        # compute state bound cost:
+        if self.bound_cost.enabled: # 关节状态限幅代价
             with profiler.record_function("cost/bound"):
                 c = self.bound_cost.forward(
                     state_batch,
                     self._goal_buffer.retract_state,
                     self._goal_buffer.batch_retract_state_idx,
                 )
-                cost_list.append(c)
+                terms.append(("bound", c))
         if self.cost_cfg.manipulability_cfg is not None and self.manipulability_cost.enabled:
             raise NotImplementedError("Manipulability Cost is not implemented")
-        if self.cost_cfg.stop_cfg is not None and self.stop_cost.enabled:
+        if self.cost_cfg.stop_cfg is not None and self.stop_cost.enabled: # 末端速度为0的代价
             st_cost = self.stop_cost.forward(state_batch.velocity)
-            cost_list.append(st_cost)
+            terms.append(("stop", st_cost))
         if self.cost_cfg.self_collision_cfg is not None and self.robot_self_collision_cost.enabled:
-            with profiler.record_function("cost/self_collision"):
+            with profiler.record_function("cost/self_collision"): # 自碰撞代价
                 coll_cost = self.robot_self_collision_cost.forward(state.robot_spheres)
-                # cost += coll_cost
-                cost_list.append(coll_cost)
-        if (
+                terms.append(("self_collision", coll_cost))
+        if ( # 环境碰撞代价
             self.cost_cfg.primitive_collision_cfg is not None
             and self.primitive_collision_cost.enabled
         ):
@@ -368,7 +385,22 @@ class ArmBase(RolloutBase, ArmBaseConfig):
                     state.robot_spheres,
                     env_query_idx=self._goal_buffer.batch_world_idx,
                 )
-                cost_list.append(coll_cost)
+                terms.append(("world_collision", coll_cost))
+        if (
+            self.cost_cfg.terminal_obstacle_cfg is not None
+            and self.terminal_obstacle_cost.enabled
+        ):
+            with profiler.record_function("cost/terminal_obstacle_distance"):
+                terminal_dist_cost = self.terminal_obstacle_cost.forward(
+                    state.robot_spheres,
+                    env_query_idx=self._goal_buffer.batch_world_idx,
+                )
+                terms.append(("terminal_obstacle_distance", terminal_dist_cost))
+        return terms
+
+    def cost_fn(self, state: KinematicModelState, action_batch=None, return_list=False):
+        terms = self.cost_terms(state, action_batch)
+        cost_list = [c for _, c in terms]
         if return_list:
             return cost_list
         if self.sum_horizon:
@@ -376,6 +408,48 @@ class ArmBase(RolloutBase, ArmBaseConfig):
         else:
             cost = cat_sum(cost_list)
         return cost
+        
+    # def cost_fn(self, state: KinematicModelState, action_batch=None, return_list=False):
+    #     # ee_pos_batch, ee_rot_batch = state_dict["ee_pos_seq"], state_dict["ee_rot_seq"]
+    #     state_batch = state.state_seq
+    #     cost_list = []
+
+    #     # compute state bound  cost:
+    #     if self.bound_cost.enabled:
+    #         with profiler.record_function("cost/bound"):
+    #             c = self.bound_cost.forward(
+    #                 state_batch,
+    #                 self._goal_buffer.retract_state,
+    #                 self._goal_buffer.batch_retract_state_idx,
+    #             )
+    #             cost_list.append(c)
+    #     if self.cost_cfg.manipulability_cfg is not None and self.manipulability_cost.enabled:
+    #         raise NotImplementedError("Manipulability Cost is not implemented")
+    #     if self.cost_cfg.stop_cfg is not None and self.stop_cost.enabled:
+    #         st_cost = self.stop_cost.forward(state_batch.velocity)
+    #         cost_list.append(st_cost)
+    #     if self.cost_cfg.self_collision_cfg is not None and self.robot_self_collision_cost.enabled:
+    #         with profiler.record_function("cost/self_collision"):
+    #             coll_cost = self.robot_self_collision_cost.forward(state.robot_spheres)
+    #             # cost += coll_cost
+    #             cost_list.append(coll_cost)
+    #     if (
+    #         self.cost_cfg.primitive_collision_cfg is not None
+    #         and self.primitive_collision_cost.enabled
+    #     ):
+    #         with profiler.record_function("cost/collision"):
+    #             coll_cost = self.primitive_collision_cost.forward(
+    #                 state.robot_spheres,
+    #                 env_query_idx=self._goal_buffer.batch_world_idx,
+    #             )
+    #             cost_list.append(coll_cost)
+    #     if return_list:
+    #         return cost_list
+    #     if self.sum_horizon:
+    #         cost = cat_sum_horizon(cost_list)
+    #     else:
+    #         cost = cat_sum(cost_list)
+    #     return cost
 
     def constraint_fn(
         self,

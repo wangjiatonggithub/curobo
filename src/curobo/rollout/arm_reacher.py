@@ -234,21 +234,13 @@ class ArmReacher(ArmBase, ArmReacherConfig):
         # check if g_dist is required in any of the cost terms:
         self.update_params(Goal(current_state=self._start_state))
 
-    def cost_fn(self, state: KinematicModelState, action_batch=None):
-        """
-        Compute cost given that state dictionary and actions
-
-
-        :class:`curobo.rollout.cost.PoseCost`
-        :class:`curobo.rollout.cost.DistCost`
-
-        """
+    def cost_terms(self, state: KinematicModelState, action_batch=None):
         state_batch = state.state_seq
-        with profiler.record_function("cost/base"):
-            cost_list = super(ArmReacher, self).cost_fn(state, action_batch, return_list=True)
+        with profiler.record_function("cost/base"): # 计算基础代价项，关节状态限幅代价、自碰撞代价、环境碰撞代价
+            terms = super(ArmReacher, self).cost_terms(state, action_batch)
         ee_pos_batch, ee_quat_batch = state.ee_pos_seq, state.ee_quat_seq
         g_dist = None
-        with profiler.record_function("cost/pose"):
+        with profiler.record_function("cost/pose"): # 计算末端位姿代价
             if (
                 self._goal_buffer.goal_pose.position is not None
                 and self.cost_cfg.pose_cfg is not None
@@ -266,8 +258,9 @@ class ArmReacher(ArmBase, ArmReacherConfig):
                     goal_cost = self.goal_cost.forward(
                         ee_pos_batch, ee_quat_batch, self._goal_buffer
                     )
-                cost_list.append(goal_cost)
-        with profiler.record_function("cost/link_poses"):
+                terms.append(("pose", goal_cost))
+                # print("goal_cost", goal_cost)
+        with profiler.record_function("cost/link_poses"): # 计算其他连杆位姿代价
             if self._goal_buffer.links_goal_pose is not None and self.cost_cfg.pose_cfg is not None:
                 link_poses = state.link_pose
 
@@ -281,9 +274,9 @@ class ArmReacher(ArmBase, ArmReacherConfig):
                             current_quat = current_pose.quaternion
 
                             c = current_fn.forward(current_pos, current_quat, self._goal_buffer, k)
-                            cost_list.append(c)
+                            terms.append((f"link_pose/{k}", c))
 
-        if (
+        if ( # 计算关节空间代价
             self._goal_buffer.goal_state is not None
             and self.cost_cfg.cspace_cfg is not None
             and self.dist_cost.enabled
@@ -294,10 +287,10 @@ class ArmReacher(ArmBase, ArmReacherConfig):
                 state_batch.position,
                 self._goal_buffer.batch_goal_state_idx,
             )
-            cost_list.append(joint_cost)
-        if self.cost_cfg.straight_line_cfg is not None and self.straight_line_cost.enabled:
+            terms.append(("cspace", joint_cost))
+        if self.cost_cfg.straight_line_cfg is not None and self.straight_line_cost.enabled: # 计算末端直线距离代价
             st_cost = self.straight_line_cost.forward(ee_pos_batch)
-            cost_list.append(st_cost)
+            terms.append(("straight_line", st_cost))
 
         if (
             self.cost_cfg.zero_acc_cfg is not None
@@ -309,20 +302,36 @@ class ArmReacher(ArmBase, ArmReacherConfig):
                 g_dist,
             )
 
-            cost_list.append(z_acc)
+            terms.append(("zero_acc", z_acc)) # 计算末端加速度为0的代价
         if self.cost_cfg.zero_jerk_cfg is not None and self.zero_jerk_cost.enabled:
             z_jerk = self.zero_jerk_cost.forward(
                 state_batch.jerk,
                 g_dist,
             )
-            cost_list.append(z_jerk)
+            terms.append(("zero_jerk", z_jerk)) # 计算末端加加速度为0的代价
 
         if self.cost_cfg.zero_vel_cfg is not None and self.zero_vel_cost.enabled:
             z_vel = self.zero_vel_cost.forward(
                 state_batch.velocity,
                 g_dist,
             )
-            cost_list.append(z_vel)
+            terms.append(("zero_vel", z_vel)) # 计算末端速度为0的代价
+        print("进入代价函数")
+        return terms
+
+    def cost_fn(self, state: KinematicModelState, action_batch=None, return_list=False):
+        """
+        Compute cost given that state dictionary and actions
+
+
+        :class:`curobo.rollout.cost.PoseCost`
+        :class:`curobo.rollout.cost.DistCost`
+
+        """
+        terms = self.cost_terms(state, action_batch)
+        cost_list = [c for _, c in terms]
+        if return_list:
+            return cost_list
         with profiler.record_function("cat_sum"):
             if self.sum_horizon:
                 cost = cat_sum_horizon_reacher(cost_list)
@@ -330,6 +339,103 @@ class ArmReacher(ArmBase, ArmReacherConfig):
                 cost = cat_sum_reacher(cost_list)
 
         return cost
+    
+    # def cost_fn(self, state: KinematicModelState, action_batch=None):
+    #     """
+    #     Compute cost given that state dictionary and actions
+
+
+    #     :class:`curobo.rollout.cost.PoseCost`
+    #     :class:`curobo.rollout.cost.DistCost`
+
+    #     """
+    #     state_batch = state.state_seq
+    #     with profiler.record_function("cost/base"):
+    #         cost_list = super(ArmReacher, self).cost_fn(state, action_batch, return_list=True)
+    #     ee_pos_batch, ee_quat_batch = state.ee_pos_seq, state.ee_quat_seq
+    #     g_dist = None
+    #     with profiler.record_function("cost/pose"):
+    #         if (
+    #             self._goal_buffer.goal_pose.position is not None
+    #             and self.cost_cfg.pose_cfg is not None
+    #             and self.goal_cost.enabled
+    #         ):
+    #             if self._compute_g_dist:
+    #                 goal_cost, rot_err_norm, goal_dist = self.goal_cost.forward_out_distance(
+    #                     ee_pos_batch,
+    #                     ee_quat_batch,
+    #                     self._goal_buffer,
+    #                 )
+
+    #                 g_dist = _compute_g_dist_jit(rot_err_norm, goal_dist)
+    #             else:
+    #                 goal_cost = self.goal_cost.forward(
+    #                     ee_pos_batch, ee_quat_batch, self._goal_buffer
+    #                 )
+    #             cost_list.append(goal_cost)
+    #     with profiler.record_function("cost/link_poses"):
+    #         if self._goal_buffer.links_goal_pose is not None and self.cost_cfg.pose_cfg is not None:
+    #             link_poses = state.link_pose
+
+    #             for k in self._goal_buffer.links_goal_pose.keys():
+    #                 if k != self.kinematics.ee_link:
+    #                     current_fn = self._link_pose_costs[k]
+    #                     if current_fn.enabled:
+    #                         # get link pose
+    #                         current_pose = link_poses[k].contiguous()
+    #                         current_pos = current_pose.position
+    #                         current_quat = current_pose.quaternion
+
+    #                         c = current_fn.forward(current_pos, current_quat, self._goal_buffer, k)
+    #                         cost_list.append(c)
+
+    #     if (
+    #         self._goal_buffer.goal_state is not None
+    #         and self.cost_cfg.cspace_cfg is not None
+    #         and self.dist_cost.enabled
+    #     ):
+
+    #         joint_cost = self.dist_cost.forward_target_idx(
+    #             self._goal_buffer.goal_state.position,
+    #             state_batch.position,
+    #             self._goal_buffer.batch_goal_state_idx,
+    #         )
+    #         cost_list.append(joint_cost)
+    #     if self.cost_cfg.straight_line_cfg is not None and self.straight_line_cost.enabled:
+    #         st_cost = self.straight_line_cost.forward(ee_pos_batch)
+    #         cost_list.append(st_cost)
+
+    #     if (
+    #         self.cost_cfg.zero_acc_cfg is not None
+    #         and self.zero_acc_cost.enabled
+    #         # and g_dist is not None
+    #     ):
+    #         z_acc = self.zero_acc_cost.forward(
+    #             state_batch.acceleration,
+    #             g_dist,
+    #         )
+
+    #         cost_list.append(z_acc)
+    #     if self.cost_cfg.zero_jerk_cfg is not None and self.zero_jerk_cost.enabled:
+    #         z_jerk = self.zero_jerk_cost.forward(
+    #             state_batch.jerk,
+    #             g_dist,
+    #         )
+    #         cost_list.append(z_jerk)
+
+    #     if self.cost_cfg.zero_vel_cfg is not None and self.zero_vel_cost.enabled:
+    #         z_vel = self.zero_vel_cost.forward(
+    #             state_batch.velocity,
+    #             g_dist,
+    #         )
+    #         cost_list.append(z_vel)
+    #     with profiler.record_function("cat_sum"):
+    #         if self.sum_horizon:
+    #             cost = cat_sum_horizon_reacher(cost_list)
+    #         else:
+    #             cost = cat_sum_reacher(cost_list)
+
+    #     return cost
 
     def convergence_fn(
         self, state: KinematicModelState, out_metrics: Optional[ArmReacherMetrics] = None

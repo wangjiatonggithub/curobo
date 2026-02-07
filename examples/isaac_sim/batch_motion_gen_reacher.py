@@ -137,7 +137,7 @@ def main():
     tensor_args = TensorDeviceType()
     robot_file = "franka.yml"
 
-    world_file = ["collision_test.yml", "collision_thin_walls.yml"]
+    world_file = ["collision_test1.yml", "collision_thin_walls.yml"]
     world_cfg_list = []
     for i in range(n_envs):
         world_cfg = WorldConfig.from_dict(
